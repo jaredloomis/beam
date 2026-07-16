@@ -1,3 +1,33 @@
+# 0.6.3.0
+
+## Added features
+
+* Added the PostgreSQL-specific, placement-indexed `PgWith` CTE builder. It can
+  lift helpers built with the portable `With Postgres` API, while the new
+  data-modifying builders produce blocks which cannot be embedded in a
+  subquery.
+* Added `pgSelectingWith` for PostgreSQL 12+ `MATERIALIZED` and
+  `NOT MATERIALIZED` SELECT CTEs, with `pgSelecting` retaining PostgreSQL's
+  default planner policy.
+* Added `cteInsertReturning`, `cteUpdateReturning`, and `cteDeleteReturning`
+  for exposing the `RETURNING` rows of PostgreSQL data-modifying CTEs through
+  `reuse`.
+* Added `cteInsert`, `cteUpdate`, and `cteDelete` for data-modifying CTEs which
+  execute for their side effects and intentionally produce no reusable rows.
+* Added support for reusable zero-column CTE projections. SELECT CTEs omit the
+  optional output alias list, while data-modifying CTEs use a private
+  `NULL::boolean` `RETURNING` value to preserve one degree-zero result row per
+  affected row without exposing a value to Beam's result decoder.
+* Added `pgSelectWithNested` and `pgSelectWithTopLevel` for consuming safe
+  nested and top-level `PgWith` blocks respectively, plus `pgInsertWith`,
+  `pgUpdateWith`, and `pgDeleteWith` for terminating a top-level `WITH` block
+  with a data-modifying statement.
+
+## Bug fixes
+
+* Fixed an issue where using `pgSelectWith` with no common-table expressions
+  would lead to an invalid SQL query at runtime.
+
 # 0.6.2.0
 
 ## Added features
@@ -7,11 +37,6 @@
   over colums of type `citext` (#818)
 * Exposed the functionality to implement user-defined extensions via
   `Database.Beam.Postgres.Extensions` (#819)
-
-## Bug fixes
-
-* Fixed an issue where using `pgSelectWith` with no common-table expressions
-  would lead to an invalid SQL query at runtime.
 
 # 0.6.1.0
 

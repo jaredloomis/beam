@@ -276,10 +276,9 @@ runInsert $
 
 ### Inner CTEs
 
-Standard SQL only allows CTEs (`WITH` expressions) at the top-level SELECT. However, PostgreSQL
-allows them anywhere, including in subqueries for joins.
-
-For example, the following is valid Postgres, but not valid standard SQL.
+`beam-core`'s `selectWith` produces a top-level `SqlSelect`. PostgreSQL also accepts a SELECT-only
+`WITH` query in a derived table, which is useful when the result must participate in a larger Beam
+query. For example:
 
 ```sql
 SELECT a.column1, b.column2
@@ -287,13 +286,195 @@ FROM (WITH RECURSIVE ... SELECT ...) a
 INNER JOIN b
 ```
 
-`beam-core` enforces this by forcing `selectWith` to only return a `SqlSelect`, which represents a
-top-level SQL `SELECT` statement that can be executed against a backend. However, if we want to
-allow `WITH` expressions to appear within joins, then we will need a function similar to
-`selectWith` but returning a `Q` value, which is a re-usable query. `beam-postgres` provides this
-function for PostgreSQL, named `pgSelectWith`. For `beam-postgres`, `select (pgSelectWith x)` is
-equivalent to `selectWith x`. But, with the new type, we can reuse CTEs (including recursive ones)
-within other queries.
+`beam-postgres` provides `pgSelectWith` for this placement. It returns a `Q` value, so its result can
+be reused in joins. Calling `select (pgSelectWith x)` projects the same rows as `selectWith x`, but
+the generated SQL contains the derived-table wrapper shown above. `pgSelectWith` is useful precisely
+when that nested `Q` is required.
+
+### PostgreSQL-specific CTEs
+
+PostgreSQL requires data-modifying CTEs to appear in a `WITH` clause attached to the top-level
+statement. `Database.Beam.Postgres.Full` provides `PgWith`, whose `PgCteNestedAllowed`
+and `PgCteTopLevelOnly` indices record that placement rule. `pgSelectWithNested` accepts only the
+nested-safe form; `pgSelectWithTopLevel`, `pgInsertWith`, `pgUpdateWith`, and `pgDeleteWith` accept
+either form because they all produce top-level statements. The existing portable `selecting`,
+`selectWith`, and `pgSelectWith` APIs keep their existing types; the PostgreSQL-specific builders
+are additive.
+
+The examples in this section use `Database.Beam.Postgres.Full`, qualified as `Pg`, which exports
+these PostgreSQL-specific statement builders.
+
+Use `pgSelecting` to define an ordinary SELECT CTE in `PgWith`. Existing helpers returning
+`With Postgres` can be composed without rewriting them by applying `pgLiftWith`; lifted and native
+CTEs share one name supply. For example, if one native CTE precedes a portable helper containing two
+CTEs, the generated names continue through the lifted action:
+
+!beam-query
+```haskell
+!example chinookdml only:Postgres
+rows <- runSelectReturningList $ Pg.pgSelectWithTopLevel $ do
+  nativeRows <- Pg.pgSelecting $
+    pure (as_ @Int32 (val_ 1))
+  portableRows <- Pg.pgLiftWith $ do
+    first <- selecting $
+      pure (as_ @Int32 (val_ 2))
+    selecting $ do
+      value <- reuse first
+      pure (value + 1)
+  pure $ (,) <$> reuse nativeRows <*> reuse portableRows
+putStrLn (show rows)
+```
+
+PostgreSQL 12 and later also support explicit materialization:
+
+!beam-query
+```haskell
+!example chinookdml only:Postgres
+rows <- runSelectReturningList $ Pg.pgSelectWithTopLevel $ do
+  materializedRows <- Pg.pgSelectingWith Pg.PgCteMaterialized $
+    pure (as_ @Int32 (val_ 1), as_ @Int32 (val_ 2))
+  pure (reuse materializedRows)
+putStrLn (show rows)
+```
+
+`PgCteDefault` emits no modifier and leaves the choice to PostgreSQL. `PgCteMaterialized` requests
+separate calculation of the CTE, which can act as an optimization fence or prevent duplicated
+computation. `PgCteNotMaterialized` allows the CTE and parent query to be optimized together, but
+may duplicate work. PostgreSQL ignores `NOT MATERIALIZED` for recursive or non-side-effect-free
+queries. These rules, and the default behavior for single and multiple references, are described in
+the [PostgreSQL CTE materialization documentation](https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-CTE-MATERIALIZATION).
+
+`cteInsertReturning`, `cteUpdateReturning`, and `cteDeleteReturning` put the corresponding
+`... RETURNING` statement in a CTE and return a `ReusableQ` handle to its output. Later CTEs or the
+final statement can read that output with `reuse`. Their side-effect-only counterparts,
+`cteInsert`, `cteUpdate`, and `cteDelete`, omit `RETURNING` and therefore return `()`:
+
+!beam-query
+```haskell
+!example chinookdml only:Postgres
+rows <- runSelectReturningList $ Pg.pgSelectWithTopLevel $ do
+  Pg.cteDelete
+    (playlist chinookDb)
+    (\row -> playlistId row ==. val_ 1000001)
+  inserted <- Pg.cteInsertReturning
+    (playlist chinookDb)
+    (insertValues [Playlist 1000000 (Just "PostgreSQL CTE example")])
+    Pg.onConflictDefault
+    id
+  case inserted of
+    Nothing -> pure $
+      filter_ (const (val_ False)) $ all_ (playlist chinookDb)
+    Just rows -> pure (reuse rows)
+putStrLn (show rows)
+```
+
+The generated statement contains both modifications in one `WITH` block. The first definition has
+no output column list because it has no `RETURNING` output. The second exposes its `RETURNING`
+output through generated column names, so it can be reused.
+
+#### Zero-column CTE projections
+
+A Beam projection may have no fields—for example, a custom `Beamable` product with a single
+constructor and no record fields. Such a result is still a relation: it has no columns, but it has
+one row for every input row. `selecting`, `pgSelecting`, and `pgSelectingWith` preserve that
+cardinality. A projection type and query can be written as follows (the helper signature lets the
+query scope be inferred at each use):
+
+```haskell
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE KindSignatures #-}
+
+import Data.Kind (Type)
+import GHC.Generics (Generic)
+
+data NoColumns (f :: Type -> Type) = NoColumns
+  deriving (Generic, Beamable)
+
+noColumns :: NoColumns (QExpr Postgres scope)
+noColumns = NoColumns
+
+degreeZeroPlaylists = Pg.pgSelectWithTopLevel $ do
+  rows <- Pg.pgSelecting $ do
+    _ <- all_ (playlist chinookDb)
+    pure noColumns
+  pure (reuse rows)
+```
+
+PostgreSQL represents the result by omitting the optional CTE column-alias list and by using a
+SELECT with an empty target list:
+
+```sql
+WITH "cte0" AS
+       (SELECT FROM "source" AS "t0")
+SELECT FROM "cte0" AS "t0"
+```
+
+When this query is run with `runSelectReturningList`, its result contains one zero-field Haskell
+value for every source row. The CTE can also be used with `EXISTS`, aggregation, or joins. Reusing
+it twice in a Cartesian product multiplies its row count in the same way as any other relation; the
+absence of columns does not make it a side-effect-only operation. The `MATERIALIZED` and
+`NOT MATERIALIZED` policies have their normal meaning for a zero-column SELECT CTE.
+
+PostgreSQL requires a data-modifying `RETURNING` clause to contain an expression. Therefore, when
+the projection supplied to `cteInsertReturning`, `cteUpdateReturning`, or `cteDeleteReturning` has
+no fields, `beam-postgres` adds one private boolean result inside the CTE:
+
+```sql
+WITH "cte0"("res0") AS
+       (DELETE FROM "source" AS "delete_target"
+        WHERE ...
+        RETURNING NULL::boolean)
+SELECT FROM "cte0" AS "t0"
+```
+
+The private `res0` value is not selected or passed to the Haskell result decoder. It exists only to
+satisfy PostgreSQL's grammar, and one sentinel row is returned for every affected row. This makes
+the degree-zero relation useful for counting, existence checks, and repeated reuse. A statement
+which affects no rows produces no result rows.
+
+When neither the final statement nor another CTE needs the rows affected by the operation, use
+`cteInsert`, `cteUpdate`, or `cteDelete`. These functions omit `RETURNING` and therefore do not
+produce a result that can be passed to `reuse`.
+
+The private-sentinel handling is specific to zero-field projections in these reusable CTE
+builders. A standalone `returning` call still requires a projection containing at least one value.
+
+PostgreSQL executes every data-modifying CTE exactly once and to completion, even when its output
+is not referenced. Sibling modifying statements use the same snapshot and cannot observe one
+another's table changes; `RETURNING` rows are the supported way to communicate between them. Avoid
+having sibling statements modify the same row, since PostgreSQL does not define which modification
+wins.
+
+See PostgreSQL's [data-modifying `WITH` documentation](https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-MODIFYING)
+for these execution and visibility rules.
+
+PostgreSQL also disallows a data-modifying CTE from recursively referring to itself. Recursive
+construction is therefore limited to `PgCteNestedAllowed`. To let a recursive SELECT feed a later
+modifying CTE, finish the recursive block and promote it with `pgToTopLevel` before adding the
+modification.
+
+A PostgreSQL `WITH` statement may finish with `INSERT`, `UPDATE`, or `DELETE` instead of a final
+SELECT. For example:
+
+!beam-query
+```haskell
+!example chinookdml only:Postgres
+runInsert $ Pg.pgInsertWith $ do
+  playlistToInsert <- Pg.pgSelecting $
+    filter_ (\source -> playlistId source ==. val_ 1) $
+      all_ (playlist chinookDb)
+  pure $ Pg.insert
+    (playlist chinookDb)
+    (insertFrom (reuse playlistToInsert))
+    (Pg.onConflict Pg.anyConflict Pg.onConflictDoNothing)
+```
+
+This produces one terminal `INSERT`, not a separate SELECT followed by an INSERT.
+
+An empty CTE insert or identity CTE update registers no definition. An empty terminal insert or
+identity terminal update remains a no-op: PostgreSQL cannot execute a bare `WITH` block, so CTE
+bodies accumulated before that missing terminal statement are not executed.
 
 As an example using our Chinook schema, suppose we had an error with all orders in the month of
 September 2024, and needed to send out employees to customer homes to correct the issue. We want to

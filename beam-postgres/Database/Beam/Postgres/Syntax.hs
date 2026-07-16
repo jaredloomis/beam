@@ -21,7 +21,7 @@ module Database.Beam.Postgres.Syntax
 
     , emit, emitBuilder, escapeString
     , escapeBytea, escapeIdentifier
-    , pgParens
+    , pgParens, PgCteRecursiveness(..), pgWithSyntax
     , pgStringLit, pgCharLit, pgBoolLit
     , nextSyntaxStep
 
@@ -30,6 +30,7 @@ module Database.Beam.Postgres.Syntax
     , PgInsertSyntax(..)
     , PgDeleteSyntax(..)
     , PgUpdateSyntax(..)
+    , PgCommonTableExpressionSyntax(..)
 
     , PgExpressionSyntax(..), PgFromSyntax(..), PgTableNameSyntax(..)
     , PgComparisonQuantifierSyntax(..)
@@ -272,8 +273,53 @@ data PgOrderingSyntax = PgOrderingSyntax { pgOrderingSyntax :: PgSyntax, pgOrder
 data PgSelectLockingClauseSyntax = PgSelectLockingClauseSyntax { pgSelectLockingClauseStrength :: PgSelectLockingStrength
                                                                , pgSelectLockingTables :: [T.Text]
                                                                , pgSelectLockingClauseOptions :: Maybe PgSelectLockingOptions }
+-- | One named definition in a PostgreSQL @WITH@ clause.
+--
+-- This is exported for PostgreSQL extension modules. Application code should
+-- normally construct CTEs through "Database.Beam.Postgres.Full".
+--
+-- @since 0.6.3.0
 newtype PgCommonTableExpressionSyntax
     = PgCommonTableExpressionSyntax { fromPgCommonTableExpression :: PgSyntax }
+
+-- | Whether a PostgreSQL @WITH@ clause is recursive.
+--
+-- Keeping this distinction explicit avoids assigning a context-dependent
+-- meaning to a 'Bool' at the low-level syntax boundary.
+--
+-- @since 0.6.3.0
+data PgCteRecursiveness
+    = PgCteNonrecursive
+      -- ^ Emit @WITH@.
+    | PgCteRecursive
+      -- ^ Emit @WITH RECURSIVE@.
+    deriving (Eq, Show)
+
+-- | Prefix a PostgreSQL statement with a common-table-expression list.
+-- The public CTE consumers use this prefix before their @SELECT@, @INSERT@,
+-- @UPDATE@, and @DELETE@ terminal statements, so this operation works on the
+-- shared raw syntax instead of giving the terminal statement a misleading
+-- type.
+--
+-- An empty list leaves the statement unchanged. 'PgCteRecursive' selects
+-- @WITH RECURSIVE@ when the CTE builder used recursive bindings.
+--
+-- @since 0.6.3.0
+pgWithSyntax
+    :: PgCteRecursiveness
+    -> [PgCommonTableExpressionSyntax]
+    -> PgSyntax
+    -> PgSyntax
+pgWithSyntax _ [] statement = statement
+pgWithSyntax recursiveness ctes statement =
+    emit withKeyword <>
+    pgSepBy (emit ", ") (map fromPgCommonTableExpression ctes) <>
+    emit " " <>
+    statement
+  where
+    withKeyword = case recursiveness of
+        PgCteNonrecursive -> "WITH "
+        PgCteRecursive -> "WITH RECURSIVE "
 
 fromPgOrdering :: PgOrderingSyntax -> PgSyntax
 fromPgOrdering (PgOrderingSyntax s Nothing) = s
@@ -622,25 +668,27 @@ instance IsSql99CommonTableExpressionSelectSyntax PgSelectSyntax where
     type Sql99SelectCTESyntax PgSelectSyntax = PgCommonTableExpressionSyntax
 
     withSyntax ctes (PgSelectSyntax select) =
-        PgSelectSyntax $
-        emit "WITH " <>
-        pgSepBy (emit ", ") (map fromPgCommonTableExpression ctes) <>
-        select
+        PgSelectSyntax (pgWithSyntax PgCteNonrecursive ctes select)
 
 instance IsSql99RecursiveCommonTableExpressionSelectSyntax PgSelectSyntax where
     withRecursiveSyntax ctes (PgSelectSyntax select) =
-        PgSelectSyntax $
-        emit "WITH RECURSIVE " <>
-        pgSepBy (emit ", ") (map fromPgCommonTableExpression ctes) <>
-        select
+        PgSelectSyntax (pgWithSyntax PgCteRecursive ctes select)
 
 instance IsSql99CommonTableExpressionSyntax PgCommonTableExpressionSyntax where
     type Sql99CTESelectSyntax PgCommonTableExpressionSyntax = PgSelectSyntax
 
     cteSubquerySyntax tbl fields (PgSelectSyntax select) =
         PgCommonTableExpressionSyntax $
-        pgQuotedIdentifier tbl <> pgParens (pgSepBy (emit ",") (map pgQuotedIdentifier fields)) <>
+        pgQuotedIdentifier tbl <> columnAliases <>
         emit " AS " <> pgParens select
+      where
+        -- PostgreSQL represents a degree-zero CTE by omitting its optional
+        -- column-alias list. Rendering an empty pair of parentheses instead
+        -- would be a syntax error.
+        columnAliases =
+          case fields of
+            [] -> mempty
+            _ -> pgParens (pgSepBy (emit ",") (map pgQuotedIdentifier fields))
 
 instance IsSql2008BigIntDataTypeSyntax PgDataTypeSyntax where
   bigIntType = PgDataTypeSyntax (PgDataTypeDescrOid (Pg.typoid Pg.int8) Nothing) (emit "BIGINT") bigIntType
@@ -1587,4 +1635,3 @@ pgRenderSyntaxScript (PgSyntax mkQuery) =
       where
         quoteIdentifierChar '"' = char8 '"' <> char8 '"'
         quoteIdentifierChar c = char8 c
-
