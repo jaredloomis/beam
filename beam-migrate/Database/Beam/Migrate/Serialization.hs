@@ -42,7 +42,9 @@ import           Data.Aeson
 import qualified Data.Aeson.Key as DAK
 import           Data.Aeson.Types (Parser)
 import qualified Data.Dependent.Map as D
+import qualified Data.EqP as E
 import qualified Data.GADT.Compare as D
+import qualified Data.OrdP as O
 import           Data.Text (Text, unpack)
 import           Data.Typeable (Typeable, (:~:)( Refl ), eqT, typeRep, typeOf)
 import qualified Data.Vector as V
@@ -294,11 +296,23 @@ beamDeserialize allD@(BeamDeserializers d) v =
 data BeamDeserializerLabel ty where
   BeamDeserializerLabel :: Typeable ty
                         => BeamDeserializerLabel ty
+instance E.EqP BeamDeserializerLabel where
+  eqP a@(BeamDeserializerLabel :: BeamDeserializerLabel a)
+      b@(BeamDeserializerLabel :: BeamDeserializerLabel b) =
+    case eqT of
+      Just (Refl :: a :~: b) -> Just Refl
+      Nothing -> Nothing
 instance D.GEq BeamDeserializerLabel where
   geq a b =
     case D.gcompare a b of
       D.GEQ -> Just Refl
       _ -> Nothing
+instance O.OrdP BeamDeserializerLabel where
+  compareP a b =
+    case D.gcompare a b of
+      D.GEQ -> O.EQ
+      D.GLT -> O.LT
+      D.GGT -> O.GT
 instance D.GCompare BeamDeserializerLabel where
   gcompare a@(BeamDeserializerLabel :: BeamDeserializerLabel a)
            b@(BeamDeserializerLabel :: BeamDeserializerLabel b) =
